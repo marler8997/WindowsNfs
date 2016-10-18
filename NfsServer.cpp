@@ -76,23 +76,23 @@ void SetupReply(char* buffer, UINT xid)
     SET_UINT  (buffer + 12, RPC_AUTH_FLAVOR_NULL_NETWORK_ORDER);
     SET_UINT  (buffer + 16, 0); // Auth is length 0
 }
-class RpcProgram
+
+typedef UINT (*ProgramCallHandler)(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, char* command, char* limit);
+
+class RpcProgramSet
 {
   public:
     const char* name;
     const UINT program;
     const UINT minVersion;
     const UINT maxVersion;
-    RpcProgram(const char* name, const UINT program, UINT minVersion, UINT maxVersion) :
-        name(name), program(program), minVersion(minVersion), maxVersion(maxVersion)
+    ProgramCallHandler* handlers;
+    RpcProgramSet(const char* name, UINT program, UINT minVersion, UINT maxVersion, ProgramCallHandler* handlers)
+        : name(name), program(program), minVersion(minVersion), maxVersion(maxVersion), handlers(handlers)
     {
     }
-
-    // Some RPC functions will handle sending the reply themselves, some
-    // can return a length that indicates the reply is in the buffer and should
-    // be sent by the caller
-    virtual UINT HandleCall(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, char* command, char* limit) = 0;
 };
+
 
 int sendWithLog(const char* context, SOCKET so, char* buffer, UINT length)
 {
@@ -114,42 +114,35 @@ int sendWithLog(const char* context, SOCKET so, char* buffer, UINT length)
 // The offset of an rpc reply for the handle call
 #define REPLY_OFFSET 24
 
-class PortmapProgram : public RpcProgram
+// Note: it is very likely that sharedBuffer will overlap with command.  Only use
+//       the shared buffer if you are done with the command.
+UINT Portmap2Handler(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, char* command, char* limit)
 {
-  public:
-    PortmapProgram() : RpcProgram("PortMap", RPC_PROGRAM_PORTMAP, 2, 2)
+    switch(callInfo->procedure)
     {
+      case PROC_NULL: // 0
+        LOG("[PORTMAP] NULL(s=%u)", sock->so);
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return 4;
+      case PORTMAP_PROC_GETPORT: // 3
+      {
+        // for now, I'm just going to return port 111 for every
+        // GETPORT request.  One technique would be to just return
+        // whichever port the current socket has connected to, so that
+        // way, you are basically guaranteed that it can connect to this
+        // port again.  In most cases, that's going to be port 111 so that's
+        // what I'll use for now.
+        LOG("[PORTMAP] GETPORT(s=%u) > %u", sock->so, 111);
+        SET_UINT  (sharedBuffer + REPLY_OFFSET + 0, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        AppendUint(sharedBuffer + REPLY_OFFSET + 4, 111); // port 111
+        return 8;
+      }
+      default:
+        LOG("[PORTMAP] unhandled procedure %u", callInfo->procedure);
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL_NETWORK_ORDER);
+        return 4;
     }
-    // Note: it is very likely that sharedBuffer will overlap with command.  Only use
-    //       the shared buffer if you are done with the command.
-    UINT HandleCall(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, char* command, char* limit)
-    {
-        switch(callInfo->procedure)
-        {
-          case PROC_NULL: // 0
-            LOG("[PORTMAP] NULL(s=%u)", sock->so);
-            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
-            return 4;
-          case PORTMAP_PROC_GETPORT: // 3
-          {
-            // for now, I'm just going to return port 111 for every
-            // GETPORT request.  One technique would be to just return
-            // whichever port the current socket has connected to, so that
-            // way, you are basically guaranteed that it can connect to this
-            // port again.  In most cases, that's going to be port 111 so that's
-            // what I'll use for now.
-            LOG("[PORTMAP] GETPORT(s=%u) > %u", sock->so, 111);
-            SET_UINT  (sharedBuffer + REPLY_OFFSET + 0, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
-            AppendUint(sharedBuffer + REPLY_OFFSET + 4, 111); // port 111
-            return 8;
-          }
-          default:
-            LOG("[PORTMAP] unhandled procedure %u", callInfo->procedure);
-            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL_NETWORK_ORDER);
-            return 4;
-        }
-    }
-};
+}
 
 UINT Align4(UINT x)
 {
@@ -179,7 +172,6 @@ UINT GetOrCreateHandle(String localName)
     char* buffer = (char*)malloc(localName.length+1); // add 1 for '\0'
     memcpy(buffer, localName.ptr, localName.length);
     buffer[localName.length] = '\0';
-    //nameHandles[handle].localName = String(buffer, localName.length);
     nameHandles[handle].localName = String(buffer, localName.length);
     LOG("Added path(handle=%u, length=%u, value='%s')",
         handle, localName.length, nameHandles[handle].localName.ptr);
@@ -230,50 +222,58 @@ UINT MNT(String pathString, char* buffer)
     return 16;
 }
 
-class MountProgram : public RpcProgram
+// Constants taken from RFC1813
+#define MOUNT3_MAX_PATH        1024
+#define MOUNT3_MAX_NAME        255
+#define MOUNT3_MAX_FILE_HANDLE 64
+// Note: it is very likely that sharedBuffer will overlap with command.  Only use
+//       the shared buffer if you are done with the command.
+UINT Mount3Handler(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, char* command, char* limit)
 {
-    // Constants taken from RFC1813
-    #define MOUNT3_MAX_PATH        1024
-    #define MOUNT3_MAX_NAME        255
-    #define MOUNT3_MAX_FILE_HANDLE 64
-
-  public:
-    MountProgram() : RpcProgram("Mount", RPC_PROGRAM_MOUNT, 3, 3)
+    switch(callInfo->procedure)
     {
-    }
-    // Note: it is very likely that sharedBuffer will overlap with command.  Only use
-    //       the shared buffer if you are done with the command.
-    UINT HandleCall(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, char* command, char* limit)
-    {
-        switch(callInfo->procedure)
+      case PROC_NULL: // 0
+        LOG("[MOUNT] NULL(s=%u)", sock->so);
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return 4;
+      case MOUNT3_PROC_MNT: // 1
+      {
+        String pathString;
+        pathString.length = ParseUint(command);
+        pathString.ptr = command + 4;
+        if(pathString.ptr + Align4(pathString.length) != limit)
         {
-          case PROC_NULL: // 0
-            LOG("[MOUNT] NULL(s=%u)", sock->so);
-            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
-            return 4;
-          case MOUNT3_PROC_MNT: // 1
-          {
-            String pathString;
-            pathString.length = ParseUint(command);
-            pathString.ptr = command + 4;
-            if(pathString.ptr + Align4(pathString.length) != limit)
-            {
-                LOG_ERROR("[MOUNT] MNT has a bad path length %u (actualSize is %u)", pathString.length, limit-pathString.ptr);
-                // TODO: setup error
-                return 0;
-            }
-            UINT length = MNT(pathString, sharedBuffer + REPLY_OFFSET + 4);
-            AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
-            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
-            return length + 4;
-          }
-          default:
-            LOG("[MOUNT] unhandled procedure %u", callInfo->procedure);
-            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL_NETWORK_ORDER);
+            LOG_ERROR("[MOUNT] MNT has a bad path length %u (actualSize is %u)", pathString.length, limit-pathString.ptr);
+            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_GARBAGE_ARGS_NETWORK_ORDER);
             return 4;
         }
+        LOG("[MOUNT] MNT(s=%u) '%.*s'", sock->so, pathString.length, pathString.ptr);
+        UINT length = MNT(pathString, sharedBuffer + REPLY_OFFSET + 4);
+        AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return length + 4;
+      }
+      case MOUNT3_PROC_UMNT: // 3
+      {
+        String pathString;
+        pathString.length = ParseUint(command);
+        pathString.ptr = command + 4;
+        if(pathString.ptr + Align4(pathString.length) != limit)
+        {
+            LOG_ERROR("[MOUNT] UMNT has a bad path length %u (actualSize is %u)", pathString.length, limit-pathString.ptr);
+            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_GARBAGE_ARGS_NETWORK_ORDER);
+            return 4;
+        }
+        LOG("[MOUNT] UMNT(s=%u) '%.*s'", sock->so, pathString.length, pathString.ptr);
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return 4;
+      }
+      default:
+        LOG("[MOUNT] unhandled procedure %u", callInfo->procedure);
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL_NETWORK_ORDER);
+        return 4;
     }
-};
+}
 
 String TryLookupHandle(char* handleBuffer, UINT handleLength)
 {
@@ -302,10 +302,26 @@ String TryLookupHandle(char* handleBuffer, UINT handleLength)
 #define MODE_OTHER_WRITE  0x0002
 #define MODE_OTHER_EXEC   0x0001
 
+// TODO: get a performance test on test
+UINT ToNfsSeconds(FILETIME filetime)
+{
+    // 100-nanoseconds = milliseconds * 10000
+    static const DWORD64 adjust = ((DWORD64)11644473600000 * (DWORD64)10000);
+
+    LARGE_INTEGER date;
+    date.HighPart = filetime.dwHighDateTime;
+    date.LowPart = filetime.dwLowDateTime;
+
+    // remove the diff between 1970 and 1601
+    date.QuadPart -= adjust;
+
+    // convert back to 100-nanoseconds to seconds
+    return date.QuadPart / 10000000;
+}
+
 // Returns: response length
 UINT GETATTR(char* handle, UINT handleLength, char* buffer)
 {
-    // lookup handle
     String localName = TryLookupHandle(handle, handleLength);
     if(localName.ptr == NULL)
     {
@@ -315,26 +331,148 @@ UINT GETATTR(char* handle, UINT handleLength, char* buffer)
         return 8;
     }
 
-    DWORD attributes = GetFileAttributes(handle);
-    LOG("[NFS] GETATTR: attributes = 0x%08x", attributes);
-
-    //SET_UINT  (buffer +  0, NFS3_STATUS_OK_NETWORK_ORDER);
-    // Add attributes
-    //SET_UINT  (buffer +  4,
-
-    return 32;
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    if(!GetFileAttributesEx(localName.ptr, GetFileExInfoStandard, &info))
     {
-        LOG("[NFS] GETATTR: not implemented");
+        LOG_ERROR("[NFS] GETATTR: GetFileAttributesEx failed (e=%d)", GetLastError());
+        SET_UINT(buffer    , NFS3_ERROR_SERVERFAULT_NETWORK_ORDER);
+        SET_UINT(buffer + 4, 0); // no post_op_attr
+        return 8;
+    }
+
+    SET_UINT(buffer, NFS3_STATUS_OK_NETWORK_ORDER);
+    if(info.dwFileAttributes | FILE_ATTRIBUTE_DIRECTORY)
+    {
+        SET_UINT(buffer + 4, NFS3_FILE_TYPE_DIR_NETWORK_ORDER);
+        info.nFileSizeHigh = 0;
+        info.nFileSizeLow = 0;
+    }
+    else
+    {
+        SET_UINT(buffer + 4, NFS3_FILE_TYPE_REG_NETWORK_ORDER);
+    }
+    AppendUint(buffer + 8, MODE_OTHER_READ | MODE_OTHER_WRITE | MODE_OTHER_EXEC);
+    SET_UINT  (buffer + 12, _1_NETWORK_ORDER); // nlinks (number of hard links to file)
+    SET_UINT  (buffer + 16, 0); // uid
+    SET_UINT  (buffer + 20, 0); // gid
+    AppendUint(buffer + 24, info.nFileSizeHigh); // size
+    AppendUint(buffer + 28, info.nFileSizeLow);
+    AppendUint(buffer + 32, info.nFileSizeHigh); // used
+    AppendUint(buffer + 36, info.nFileSizeLow);
+    SET_UINT  (buffer + 40, 0); // rdev
+    SET_UINT  (buffer + 44, 0);
+    SET_UINT  (buffer + 48, 0); // fsid
+    SET_UINT  (buffer + 52, 0);
+    SET_UINT  (buffer + 56, 0); // fileid (just set handle for now)
+    SET_UINT  (buffer + 60, *(UINT*)handle);
+    AppendUint(buffer + 64, ToNfsSeconds(info.ftLastAccessTime));
+    SET_UINT  (buffer + 68, 0); // nanoseconds
+    AppendUint(buffer + 72, ToNfsSeconds(info.ftLastWriteTime));
+    SET_UINT  (buffer + 76, 0); // nanoseconds
+    AppendUint(buffer + 80, ToNfsSeconds(info.ftCreationTime));
+    SET_UINT  (buffer + 84, 0); // nanoseconds
+    LOG("[NFS] GETATTR \"%s\"", localName.ptr);
+    return 88;
+}
+
+// Returns: response length
+UINT ACCESS(char* handle, UINT handleLength, UINT flags, char* buffer)
+{
+    String localName = TryLookupHandle(handle, handleLength);
+    if(localName.ptr == NULL)
+    {
+        LOG("[NFS] ACCESS: bad handle");
         SET_UINT(buffer    , NFS3_ERROR_BADHANDLE_NETWORK_ORDER);
         SET_UINT(buffer + 4, 0); // no post_op_attr
         return 8;
     }
+
+    SET_UINT  (buffer + 0 , NFS3_STATUS_OK_NETWORK_ORDER);
+    SET_UINT  (buffer + 4, 0);     // no post-op_attr
+    AppendUint(buffer + 8, flags); // Just return all the flags for now
+    return 12;
+}
+
+
+
+// Returns: response length
+UINT READDIRPLUS(char* handle, UINT handleLength, char* buffer)
+{
+    String localName = TryLookupHandle(handle, handleLength);
+    if(localName.ptr == NULL)
+    {
+        LOG("[NFS] READDIRPLUS: bad handle");
+        SET_UINT(buffer    , NFS3_ERROR_BADHANDLE_NETWORK_ORDER);
+        SET_UINT(buffer + 4, 0); // no post_op_attr
+        return 8;
+    }
+
+    LOG("[NFS] READDIRPLUS");
+    SET_UINT  (buffer     , NFS3_STATUS_OK_NETWORK_ORDER);
+    SET_UINT  (buffer +  4, 0); // no post_op_attr
+    SET_UINT  (buffer +  8, 0); // cookieverf
+    SET_UINT  (buffer + 12, 0);
+
+    /*
+    {
+        WIN32_FIND_DATA findData;
+        HANDLE findHandle = FindFirstFile(localName.ptr, &findData);
+        if(findHandle  == INVALID_HANDLE_VALUE)
+        {
+            LOG("[NFS] READDIRPLUS: FindFirstFile failed (e=%d)", GetLastError());
+            SET_UINT(buffer    , NFS3_ERROR_SERVERFAULT_NETWORK_ORDER);
+            SET_UINT(buffer + 4, 0); // no post_op_attr
+            return 8;
+        }
+
+        do
+        {
+            // Send back phony file
+            SET_UINT  (buffer + 16, _1_NETWORK_ORDER); // more entries?
+            SET_UINT  (buffer + 20, 0);  // fileid (just set handle for now)
+            AppendUint(buffer + 24, 42);
+            AppendUint(buffer + 28, 5);
+            buffer[32] = 'p';
+            buffer[33] = 'h';
+            buffer[34] = 'o';
+            buffer[35] = 'n';
+            buffer[36] = 'y';
+            SET_UINT  (buffer + 40, 0); // cookie
+            SET_UINT  (buffer + 44, 0);
+            SET_UINT  (buffer + 48, 0); // no post_op_attr
+            SET_UINT  (buffer + 52, 0); // no handle
+            //UINT phonyHandle = GetOrCreateHandle(String("phony", LITERAL_LENGTH("phony")));
+            //AppendUint(buffer + 52, 4); // file handle
+            //AppendUint(buffer + 56, phonyHandle);
+        }
+    }
+    */
+
+    // Send back phony file
+    SET_UINT  (buffer + 16, _1_NETWORK_ORDER); // more entries?
+    SET_UINT  (buffer + 20, 0);  // fileid (just set handle for now)
+    AppendUint(buffer + 24, 42);
+    AppendUint(buffer + 28, 5);
+    buffer[32] = 'p';
+    buffer[33] = 'h';
+    buffer[34] = 'o';
+    buffer[35] = 'n';
+    buffer[36] = 'y';
+    SET_UINT  (buffer + 40, 0); // cookie
+    SET_UINT  (buffer + 44, 0);
+    SET_UINT  (buffer + 48, 0); // no post_op_attr
+    SET_UINT  (buffer + 52, 0); // no handle
+    //UINT phonyHandle = GetOrCreateHandle(String("phony", LITERAL_LENGTH("phony")));
+    //AppendUint(buffer + 52, 4); // file handle
+    //AppendUint(buffer + 56, phonyHandle);
+    SET_UINT  (buffer + 56, 0); // more entries?
+    SET_UINT  (buffer + 60, _1_NETWORK_ORDER); // eof
+    return 64;
 }
 
 // Returns: response length
 UINT FSINFO(char* handle, UINT handleLength, char* buffer)
 {
-    // lookup handle
     String localName = TryLookupHandle(handle, handleLength);
     if(localName.ptr == NULL)
     {
@@ -364,7 +502,6 @@ UINT FSINFO(char* handle, UINT handleLength, char* buffer)
 // Returns: response length
 UINT PATHCONF(char* handle, UINT handleLength, char* buffer)
 {
-    // lookup handle
     String localName = TryLookupHandle(handle, handleLength);
     if(localName.ptr == NULL)
     {
@@ -385,95 +522,135 @@ UINT PATHCONF(char* handle, UINT handleLength, char* buffer)
     return 32;
 }
 
-
-class NfsProgram : public RpcProgram
+#define NFS3_RESPONSE_OK 0
+#define NFS3_RESPONSE_OK 0
+#define NFS3_PROCEDURE_NULL 0
+// Note: it is very likely that sharedBuffer will overlap with command.  Only use
+//       the shared buffer if you are done with the command.
+UINT Nfs3Handler(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, char* command, char* limit)
 {
-    #define NFS3_RESPONSE_OK 0
-    #define NFS3_RESPONSE_OK 0
-    #define NFS3_PROCEDURE_NULL 0
-
-  public:
-    NfsProgram() : RpcProgram("Nfs", RPC_PROGRAM_NFS, 3, 3)
+    switch(callInfo->procedure)
     {
-    }
-    // Note: it is very likely that sharedBuffer will overlap with command.  Only use
-    //       the shared buffer if you are done with the command.
-    UINT HandleCall(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, char* command, char* limit)
-    {
-        switch(callInfo->procedure)
+      case PROC_NULL: // 0
+        LOG("[NFS] NULL(s=%u)", sock->so);
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return 4;
+      case NFS3_PROC_GETATTR: // 1
+      {
+        UINT handleLength = ParseUint(command);
+        char* handle = command + 4;
+        if(handle + Align4(handleLength) != limit)
         {
-          case PROC_NULL: // 0
-            LOG("[NFS] NULL(s=%u)", sock->so);
-            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
-            return 4;
-          case NFS3_PROC_GETATTR: // 1
-          {
-            UINT handleLength = ParseUint(command);
-            char* handle = command + 4;
-            if(handle + Align4(handleLength) != limit)
-            {
-                LOG_ERROR("[NFS] GETATTR has a bad handle length %u (actualSize is %u)", handleLength, limit-handle);
-                // TODO: setup error
-                return 0;
-            }
-            LOG("[NFS] GETATTR handle is %u bytes", handleLength);
-            UINT length = GETATTR(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4);
-            AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
-            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
-            return length + 4;
-          }
-          case NFS3_PROC_FSINFO: // 19
-          {
-            UINT handleLength = ParseUint(command);
-            char* handle = command + 4;
-            if(handle + Align4(handleLength) != limit)
-            {
-                LOG_ERROR("[NFS] FSINFO has a bad handle length %u (actualSize is %u)", handleLength, limit-handle);
-                // TODO: setup error
-                return 0;
-            }
-            LOG("[NFS] FSINFO handle is %u bytes", handleLength);
-            UINT length = FSINFO(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4);
-            AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
-            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
-            return length + 4;
-          }
-          case NFS3_PROC_PATHCONF: // 20
-          {
-            UINT handleLength = ParseUint(command);
-            char* handle = command + 4;
-            if(handle + Align4(handleLength) != limit)
-            {
-                LOG_ERROR("[NFS] PATHCONF has a bad handle length %u (actualSize is %u)", handleLength, limit-handle);
-                // TODO: setup error
-                return 0;
-            }
-            LOG("[NFS] PATHCONF handle is %u bytes", handleLength);
-            UINT length = PATHCONF(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4);
-            AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
-            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
-            return length + 4;
-          }
-          default:
-            LOG("[NFS] unhandled procedure %u", callInfo->procedure);
-            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL_NETWORK_ORDER);
+            LOG_ERROR("[NFS] GETATTR has a bad handle length %u (actualSize is %u)", handleLength, limit-handle);
+            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_GARBAGE_ARGS_NETWORK_ORDER);
             return 4;
         }
+        LOG("[NFS] GETATTR handle is %u bytes", handleLength);
+        UINT length = GETATTR(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4);
+        AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return length + 4;
+      }
+      case NFS3_PROC_ACCESS: // 4
+      {
+        UINT handleLength = ParseUint(command);
+        char* handle = command + 4;
+        UINT accessFlags;
+        {
+            char* endOfHandle = handle + Align4(handleLength);
+            if(endOfHandle + 4 != limit)
+            {
+                LOG_ERROR("[NFS] ACCESS has invalid arguments");
+                SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_GARBAGE_ARGS_NETWORK_ORDER);
+                return 4;
+            }
+            accessFlags = ParseUint(endOfHandle);
+        }
+        LOG("[NFS] ACCESS handle is %u bytes, flags = 0x%08x", handleLength, accessFlags);
+        UINT length = ACCESS(handle, handleLength, accessFlags, sharedBuffer + REPLY_OFFSET + 4);
+        AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return length + 4;
+      }
+      case NFS3_PROC_READDIRPLUS: // 17
+      {
+        UINT handleLength = ParseUint(command);
+        char* handle = command + 4;
+        char* endOfHandle = handle + Align4(handleLength);
+        if(endOfHandle + 24 != limit)
+        {
+            LOG_ERROR("[NFS] READDIRPLUS has invalid arguments");
+            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_GARBAGE_ARGS_NETWORK_ORDER);
+            return 4;
+        }
+        LOG("[NFS] READDIRPLUS handle is %u bytes", handleLength);
+        UINT length = READDIRPLUS(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4);
+        AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return length + 4;
+      }
+      case NFS3_PROC_FSINFO: // 19
+      {
+        UINT handleLength = ParseUint(command);
+        char* handle = command + 4;
+        if(handle + Align4(handleLength) != limit)
+        {
+            LOG_ERROR("[NFS] FSINFO has a bad handle length %u (actualSize is %u)", handleLength, limit-handle);
+            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_GARBAGE_ARGS_NETWORK_ORDER);
+            return 4;
+        }
+        LOG("[NFS] FSINFO handle is %u bytes", handleLength);
+        UINT length = FSINFO(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4);
+        AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return length + 4;
+      }
+      case NFS3_PROC_PATHCONF: // 20
+      {
+        UINT handleLength = ParseUint(command);
+        char* handle = command + 4;
+        if(handle + Align4(handleLength) != limit)
+        {
+            LOG_ERROR("[NFS] PATHCONF has a bad handle length %u (actualSize is %u)", handleLength, limit-handle);
+            SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_GARBAGE_ARGS_NETWORK_ORDER);
+            return 4;
+        }
+        LOG("[NFS] PATHCONF handle is %u bytes", handleLength);
+        UINT length = PATHCONF(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4);
+        AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return length + 4;
+      }
+      default:
+        LOG("[NFS] unhandled procedure %u", callInfo->procedure);
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL_NETWORK_ORDER);
+        return 4;
     }
+}
+UINT Nfs4Handler(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, char* command, char* limit)
+{
+    switch(callInfo->procedure)
+    {
+      case PROC_NULL: // 0
+        LOG("[NFS] NULL(s=%u)", sock->so);
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
+        return 4;
+      default:
+        LOG("[NFS] unhandled procedure %u", callInfo->procedure);
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL_NETWORK_ORDER);
+        return 4;
+    }
+}
+
+ProgramCallHandler portmapHandlers[] = {&Portmap2Handler};
+ProgramCallHandler nfsHandlers[]     = {&Nfs3Handler, &Nfs4Handler};
+ProgramCallHandler mountHandlers[]   = {&Mount3Handler};
+
+RpcProgramSet Programs[] = {
+    RpcProgramSet("Portmap", RPC_PROGRAM_PORTMAP, 2, 2, portmapHandlers),
+    RpcProgramSet("Nfs"    , RPC_PROGRAM_NFS    , 3, 4, nfsHandlers),
+    RpcProgramSet("Mount"  , RPC_PROGRAM_MOUNT  , 3, 3, mountHandlers),
 };
-
-PortmapProgram portmapProgram;
-MountProgram mountProgram;
-NfsProgram nfsProgram;
-
-RpcProgram* Programs[] = {
-    &nfsProgram,
-    &mountProgram,
-    &portmapProgram,
-};
-
-
-
 
 // Return: 1 on error
 // Note: it is very likely that sharedBuffer will overlap with command.  Only use
@@ -544,22 +721,23 @@ int HandleRpcCommand(SelectSock* sock, char* sharedBuffer, char* command, char* 
         UINT replySize;
         for(unsigned i = 0; i < STATIC_ARRAY_LENGTH(Programs); i++)
         {
-            if(Programs[i]->program == callInfo.program)
+            if(Programs[i].program == callInfo.program)
             {
                 foundProgram = true;
 
-                if(callInfo.programVersion < Programs[i]->minVersion ||
-                   callInfo.programVersion > Programs[i]->minVersion)
+                if(callInfo.programVersion < Programs[i].minVersion ||
+                   callInfo.programVersion > Programs[i].maxVersion)
                 {
-                    LOG_RPC("Program %s(%u) does not support version %u", Programs[i]->name, callInfo.program, callInfo.programVersion);
+                    LOG_RPC("Program %s(%u) does not support version %u", Programs[i].name, callInfo.program, callInfo.programVersion);
                     SET_UINT  (sharedBuffer + 24, RPC_REPLY_ACCEPT_STATUS_PROG_MISMATCH_NETWORK_ORDER);
-                    AppendUint(sharedBuffer + 28, Programs[i]->minVersion);
-                    AppendUint(sharedBuffer + 32, Programs[i]->maxVersion);
+                    AppendUint(sharedBuffer + 28, Programs[i].minVersion);
+                    AppendUint(sharedBuffer + 32, Programs[i].maxVersion);
                     replySize = 12;
                 }
                 else
                 {
-                    replySize = Programs[i]->HandleCall(sock, &callInfo, sharedBuffer, command, limit);
+                    replySize = Programs[i].handlers[callInfo.programVersion - Programs[i].minVersion]
+                        (sock, &callInfo, sharedBuffer, command, limit);
                 }
                 break;
             }
@@ -576,7 +754,6 @@ int HandleRpcCommand(SelectSock* sock, char* sharedBuffer, char* command, char* 
         {
             AppendUint(sharedBuffer +  0, RPC_LAST_FRAGMENT_FLAG | (REPLY_OFFSET - 4 + replySize));
             SetupReply(sharedBuffer +  4, callInfo.xid);
-            LOG("[DEBUG] sending %u bytes...", REPLY_OFFSET + replySize);
             sendWithLog("[RPC]", sock->so, (char*)sharedBuffer, REPLY_OFFSET + replySize);
         }
 
@@ -609,12 +786,12 @@ void RpcTcpRecvHandler(SynchronizedSelectServer server, SelectSock* sock, PopRea
     LOG_NET("RpcTcpRecvHandler(s=%d) Got %u bytes", sock->so, size);
     char* data = sharedBuffer;
 
-    bool lastFragment = data[0] >> 7;
+    bool lastFragment = (unsigned char)data[0] >> 7;
     UINT fragmentLength =
-        (data[0] & 0x7F) << 24 |
-        data[1] << 16 |
-        data[2] <<  8 |
-        data[3]       ;
+        ((unsigned char)data[0] & 0x7F) << 24 |
+        (unsigned char)data[1] << 16 |
+        (unsigned char)data[2] <<  8 |
+        (unsigned char)data[3]       ;
     if(!lastFragment)
     {
         LOG_ERROR("multiple fragments not implemented");

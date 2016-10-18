@@ -192,7 +192,7 @@ int run()
     {
         UINT callSize = SetupCall(RPC_PROGRAM_NFS_NETWORK_ORDER, 0x4289, PROC_NULL, 0);
         TEST_ASSERT(TestCall(&conn, 0x23547890, callSize,
-            3, RPC_REPLY_ACCEPT_STATUS_PROG_MISMATCH, 3, 3), __LINE__, "test failed");
+            3, RPC_REPLY_ACCEPT_STATUS_PROG_MISMATCH, 3, 4), __LINE__, "test failed");
     }
 
     //
