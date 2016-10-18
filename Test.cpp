@@ -80,6 +80,7 @@ UINT SetupCall(UINT programNetworkOrder, UINT progVersionNetworkOrder, UINT proc
     for(int i = 0; i < argCount; i++)
     {
         AppendUint(buffer + offset, va_arg(args, UINT));
+        offset += 4;
     }
     va_end(args);
     return offset;
@@ -135,12 +136,16 @@ int run()
     // Test that the NULL procedures work
     //
     {
-        UINT callSize = SetupCall(RPC_PROGRAM_PORTMAP_NETWORK_ORDER, TWO_NETWORK_ORDER, PROC_NULL, 0);
-        TEST_ASSERT(TestCall(&conn, 0x40f18a0f, callSize, 1, 0), __LINE__, "PORTMAPv2 NULL failed");
+        UINT callSize = SetupCall(RPC_PROGRAM_PORTMAP_NETWORK_ORDER, _2_NETWORK_ORDER, PROC_NULL, 0);
+        TEST_ASSERT(TestCall(&conn, 0x40f18a0f, callSize, 1, RPC_REPLY_ACCEPT_STATUS_SUCCESS), __LINE__, "PORTMAPv2 NULL failed");
     }
     {
-        UINT callSize = SetupCall(RPC_PROGRAM_NFS_NETWORK_ORDER, THREE_NETWORK_ORDER, PROC_NULL, 0);
-        TEST_ASSERT(TestCall(&conn, 0xab9828de, callSize, 1, 0), __LINE__, "NFSv3 NULL failed");
+        UINT callSize = SetupCall(RPC_PROGRAM_MOUNT_NETWORK_ORDER, _3_NETWORK_ORDER, PROC_NULL, 0);
+        TEST_ASSERT(TestCall(&conn, 0xaf29bec8, callSize, 1, RPC_REPLY_ACCEPT_STATUS_SUCCESS), __LINE__, "MOUNTv4 NULL failed");
+    }
+    {
+        UINT callSize = SetupCall(RPC_PROGRAM_NFS_NETWORK_ORDER, _3_NETWORK_ORDER, PROC_NULL, 0);
+        TEST_ASSERT(TestCall(&conn, 0xab9828de, callSize, 1, RPC_REPLY_ACCEPT_STATUS_SUCCESS), __LINE__, "NFSv3 NULL failed");
     }
 
     // TODO: test malformed calls
@@ -151,19 +156,19 @@ int run()
     #define RPC_VERSION_OFFSET 12
     // Test invalid rpc version 0
     {
-        UINT callSize = SetupCall(RPC_PROGRAM_PORTMAP_NETWORK_ORDER, TWO_NETWORK_ORDER, PROC_NULL, 0);
+        UINT callSize = SetupCall(RPC_PROGRAM_PORTMAP_NETWORK_ORDER, _2_NETWORK_ORDER, PROC_NULL, 0);
         AppendUint(buffer + RPC_VERSION_OFFSET, 0);
         TEST_ASSERT(TestInvalidCall(0x9e0f824c, callSize), __LINE__, "TestInvalidCall failed");
     }
     // Test invalid rpc version 1
     {
-        UINT callSize = SetupCall(RPC_PROGRAM_PORTMAP_NETWORK_ORDER, TWO_NETWORK_ORDER, PROC_NULL, 0);
+        UINT callSize = SetupCall(RPC_PROGRAM_PORTMAP_NETWORK_ORDER, _2_NETWORK_ORDER, PROC_NULL, 0);
         AppendUint(buffer + RPC_VERSION_OFFSET, 1);
         TEST_ASSERT(TestInvalidCall(0x97e9b9a7, callSize), __LINE__, "TestInvalidCall failed");
     }
     // Test invalid rpc version 3
     {
-        UINT callSize = SetupCall(RPC_PROGRAM_PORTMAP_NETWORK_ORDER, TWO_NETWORK_ORDER, PROC_NULL, 0);
+        UINT callSize = SetupCall(RPC_PROGRAM_PORTMAP_NETWORK_ORDER, _2_NETWORK_ORDER, PROC_NULL, 0);
         AppendUint(buffer + RPC_VERSION_OFFSET, 3);
         TEST_ASSERT(TestInvalidCall(0x1fb8a732, callSize), __LINE__, "TestInvalidCall failed");
     }
@@ -194,14 +199,22 @@ int run()
     // Test procedure unavailable
     //
     {
-        UINT callSize = SetupCall(RPC_PROGRAM_PORTMAP_NETWORK_ORDER, TWO_NETWORK_ORDER, 0x9184, 0);
+        UINT callSize = SetupCall(RPC_PROGRAM_PORTMAP_NETWORK_ORDER, _2_NETWORK_ORDER, 0x9184, 0);
         TEST_ASSERT(TestCall(&conn, 0x5918f8a9, callSize,
             1, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL), __LINE__, "test failed");
     }
     {
-        UINT callSize = SetupCall(RPC_PROGRAM_NFS_NETWORK_ORDER, THREE_NETWORK_ORDER, 0x4f20, 0);
+        UINT callSize = SetupCall(RPC_PROGRAM_NFS_NETWORK_ORDER, _3_NETWORK_ORDER, 0x4f20, 0);
         TEST_ASSERT(TestCall(&conn, 0x1948f910, callSize,
             1, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL), __LINE__, "test failed");
+    }
+
+    // TODO: test a handle length of 0, some other value like 10, test max value of 64, and a value that is too large
+    {
+        UINT callSize = SetupCall(RPC_PROGRAM_NFS_NETWORK_ORDER, _3_NETWORK_ORDER, NFS3_PROC_FSINFO_NETWORK_ORDER,
+            2, 4, 0x84398184);
+        TEST_ASSERT(TestCall(&conn, 0xa819f9e8, callSize,
+            3, RPC_REPLY_ACCEPT_STATUS_SUCCESS, NFS3_ERROR_BADHANDLE, 0), __LINE__, "test failed");
     }
 
     return TEST_SUCCESS;
