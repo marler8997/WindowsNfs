@@ -1,6 +1,7 @@
 #pragma once
 
 #define LOG_ERROR(fmt,...) printf("Error: " fmt "\r\n",##__VA_ARGS__)
+#define LOG_DEBUG(fmt,...) printf("Debug: " fmt "\r\n",##__VA_ARGS__)
 #define LOG(fmt,...)       printf(fmt "\r\n",##__VA_ARGS__)
 
 #define LOG_NET(fmt,...)   //printf("[NET] " fmt "\r\n",##__VA_ARGS__)

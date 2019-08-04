@@ -1,3 +1,4 @@
+#include <malloc.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
@@ -351,7 +352,11 @@ UINT GETATTR(char* handle, UINT handleLength, char* buffer)
     {
         SET_UINT(buffer + 4, NFS3_FILE_TYPE_REG_NETWORK_ORDER);
     }
-    AppendUint(buffer + 8, MODE_OTHER_READ | MODE_OTHER_WRITE | MODE_OTHER_EXEC);
+    AppendUint(buffer + 8,
+        // Grant all permissions for now
+        MODE_OWNER_READ | MODE_OWNER_WRITE | MODE_OWNER_EXEC |
+        MODE_GROUP_READ | MODE_GROUP_WRITE | MODE_GROUP_EXEC |
+        MODE_OTHER_READ | MODE_OTHER_WRITE | MODE_OTHER_EXEC);
     SET_UINT  (buffer + 12, _1_NETWORK_ORDER); // nlinks (number of hard links to file)
     SET_UINT  (buffer + 16, 0); // uid
     SET_UINT  (buffer + 20, 0); // gid
@@ -393,10 +398,27 @@ UINT ACCESS(char* handle, UINT handleLength, UINT flags, char* buffer)
     return 12;
 }
 
-
+// This single function call goes in it's own function because it's using alloca
+HANDLE FindFirstFileAt(String dir, WIN32_FIND_DATA* data)
+{
+    // alloca should be fine here, max path is a few hundred characters
+    char *findString = (char*)alloca(dir.length + 3);
+    if (!findString)
+    {
+        LOG("[NFS] out of memory");
+        SET_UINT(buffer    , NFS3_ERROR_SERVERFAULT_NETWORK_ORDER);
+        SET_UINT(buffer + 4, 0); // no post_op_attr
+        return 8;
+    }
+    memcpy(findString, dir.ptr, dir.length);
+    findString[dir.length + 0] = '\\';
+    findString[dir.length + 1] = '*';
+    findString[dir.length + 2] = '\0';
+    return FindFirstFileA(findString, data);
+}
 
 // Returns: response length
-UINT READDIRPLUS(char* handle, UINT handleLength, char* buffer)
+UINT READDIRPLUS(char* handle, UINT handleLength, char* buffer, UINT64 cookie)
 {
     String localName = TryLookupHandle(handle, handleLength);
     if(localName.ptr == NULL)
@@ -407,16 +429,29 @@ UINT READDIRPLUS(char* handle, UINT handleLength, char* buffer)
         return 8;
     }
 
-    LOG("[NFS] READDIRPLUS");
+    LOG("[NFS] READDIRPLUS \"%s\" cookie=%llu", localName.ptr, (unsigned long long)cookie);
+    if (cookie != 0)
+    {
+        LOG("[NFS] READDIRPLUS non-zero cookie not implemented");
+        SET_UINT(buffer    , NFS3_ERROR_NOT_SUPPORTED_NETWORK_ORDER);
+        SET_UINT(buffer + 4, 0); // no post_op_attr
+        return 8;
+    }
+
     SET_UINT  (buffer     , NFS3_STATUS_OK_NETWORK_ORDER);
     SET_UINT  (buffer +  4, 0); // no post_op_attr
-    SET_UINT  (buffer +  8, 0); // cookieverf
-    SET_UINT  (buffer + 12, 0);
+    SET_UINT64(buffer +  8, 0); // cookieverf
 
-    /*
+    // TODO: read the directory contents into memory
+    //       send as many entries as we can, if there is any left
+    //       over then save it in a cookie and give it a cookie verifier
+    //       on the next request, see that the cookie is non-zero.
+    //       in this case check that the saved directory is still the same as what was
+    //       read before.
+
     {
         WIN32_FIND_DATA findData;
-        HANDLE findHandle = FindFirstFile(localName.ptr, &findData);
+        HANDLE findHandle = FindFirstFileAt(localName, &findData);
         if(findHandle  == INVALID_HANDLE_VALUE)
         {
             LOG("[NFS] READDIRPLUS: FindFirstFile failed (e=%d)", GetLastError());
@@ -424,14 +459,14 @@ UINT READDIRPLUS(char* handle, UINT handleLength, char* buffer)
             SET_UINT(buffer + 4, 0); // no post_op_attr
             return 8;
         }
-
+        size_t offset = 16;
         do
         {
             // Send back phony file
-            SET_UINT  (buffer + 16, _1_NETWORK_ORDER); // more entries?
-            SET_UINT  (buffer + 20, 0);  // fileid (just set handle for now)
-            AppendUint(buffer + 24, 42);
-            AppendUint(buffer + 28, 5);
+            SET_UINT  (buffer + offset +  0, _1_NETWORK_ORDER); // more entries?
+            SET_UINT  (buffer + offset +  4, 0);  // fileid (just set handle for now)
+            AppendUint(buffer + offset +  8, 42);
+            AppendUint(buffer + offset + 12, 5);
             buffer[32] = 'p';
             buffer[33] = 'h';
             buffer[34] = 'o';
@@ -446,8 +481,6 @@ UINT READDIRPLUS(char* handle, UINT handleLength, char* buffer)
             //AppendUint(buffer + 56, phonyHandle);
         }
     }
-    */
-
     // Send back phony file
     SET_UINT  (buffer + 16, _1_NETWORK_ORDER); // more entries?
     SET_UINT  (buffer + 20, 0);  // fileid (just set handle for now)
@@ -545,11 +578,17 @@ UINT Nfs3Handler(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, ch
             SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_GARBAGE_ARGS_NETWORK_ORDER);
             return 4;
         }
-        LOG("[NFS] GETATTR handle is %u bytes", handleLength);
+        LOG_DEBUG("[NFS] GETATTR handle is %u bytes", handleLength);
         UINT length = GETATTR(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4);
         AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
         SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
         return length + 4;
+      }
+      case NFS3_PROC_LOOKUP: // 3
+      {
+        LOG("[NFS] LOOKUP(procedure 3) not implemented");
+        SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL_NETWORK_ORDER);
+        return 4;
       }
       case NFS3_PROC_ACCESS: // 4
       {
@@ -566,7 +605,7 @@ UINT Nfs3Handler(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, ch
             }
             accessFlags = ParseUint(endOfHandle);
         }
-        LOG("[NFS] ACCESS handle is %u bytes, flags = 0x%08x", handleLength, accessFlags);
+        LOG_DEBUG("[NFS] ACCESS handle is %u bytes, flags = 0x%08x", handleLength, accessFlags);
         UINT length = ACCESS(handle, handleLength, accessFlags, sharedBuffer + REPLY_OFFSET + 4);
         AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
         SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
@@ -583,8 +622,9 @@ UINT Nfs3Handler(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, ch
             SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_GARBAGE_ARGS_NETWORK_ORDER);
             return 4;
         }
-        LOG("[NFS] READDIRPLUS handle is %u bytes", handleLength);
-        UINT length = READDIRPLUS(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4);
+        LOG_DEBUG("[NFS] READDIRPLUS handle is %u bytes", handleLength);
+        UINT64 cookie = ParseUint64(endOfHandle);
+        UINT length = READDIRPLUS(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4, cookie);
         AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
         SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
         return length + 4;
@@ -615,7 +655,7 @@ UINT Nfs3Handler(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, ch
             SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_GARBAGE_ARGS_NETWORK_ORDER);
             return 4;
         }
-        LOG("[NFS] PATHCONF handle is %u bytes", handleLength);
+        LOG_DEBUG("[NFS] PATHCONF handle is %u bytes", handleLength);
         UINT length = PATHCONF(handle, handleLength, sharedBuffer + REPLY_OFFSET + 4);
         AppendUint(sharedBuffer, RPC_LAST_FRAGMENT_FLAG | (24+length));
         SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
@@ -632,11 +672,11 @@ UINT Nfs4Handler(SelectSock* sock, RpcCallInfo* callInfo, char* sharedBuffer, ch
     switch(callInfo->procedure)
     {
       case PROC_NULL: // 0
-        LOG("[NFS] NULL(s=%u)", sock->so);
+        LOG("[NFSv4] NULL(s=%u)", sock->so);
         SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_SUCCESS_NETWORK_ORDER);
         return 4;
       default:
-        LOG("[NFS] unhandled procedure %u", callInfo->procedure);
+        LOG("[NFSv4] unhandled procedure %u", callInfo->procedure);
         SET_UINT(sharedBuffer + REPLY_OFFSET, RPC_REPLY_ACCEPT_STATUS_PROC_UNAVAIL_NETWORK_ORDER);
         return 4;
     }
